@@ -1,0 +1,168 @@
+name: Prod Deploy
+
+on:
+  workflow_dispatch:
+
+# No `concurrency:` queueing — a second deploy must FAIL FAST rather than queue
+# and run later. One-at-a-time is enforced by the approval job's
+# "Ensure single in-flight deploy" guard below.
+
+permissions:
+  contents: read
+
+jobs:
+  # Workflow-level approval gate. Native Environment "required reviewers" is
+  # unavailable here (private repo on the Team plan needs Enterprise), so we
+  # replicate a second-person sign-off inline with the first-party
+  # actions/github-script — no third-party action to vet or pin.
+  approval:
+    name: Require second-developer approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      issues: write
+      actions: read  # list this workflow's runs to detect another in-flight deploy
+    steps:
+      # Fail fast if another deploy of this workflow is already underway (e.g. one
+      # sitting in the approval wait). Runs BEFORE the app token is minted and
+      # BEFORE any approval issue is created, so a rejected attempt costs nothing.
+      - name: Ensure single in-flight deploy
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const me = context.runId;
+            const cur = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: me });
+            const workflow_id = cur.data.workflow_id;
+
+            // Gather all currently-active runs of THIS workflow.
+            const seen = new Map();
+            for (const status of ['in_progress', 'queued', 'waiting']) {
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id, status, per_page: 100,
+              });
+              for (const r of runs) seen.set(r.id, r);
+            }
+            // Oldest run wins: fail only if an OLDER active run exists, so exactly
+            // one survives even if two are dispatched near-simultaneously.
+            const blockers = [...seen.values()].filter(r => r.id < me);
+            if (blockers.length) {
+              const list = blockers.map(r => `#${r.run_number} (${r.status}) ${r.html_url}`).join(', ');
+              core.setFailed(`Another deploy is already in progress: ${list}. Stopping before creating an approval request — wait for it to finish or be approved/denied, then re-run.`);
+            } else {
+              core.info('No other in-flight deploy detected; proceeding.');
+            }
+
+      # Mint a short-lived installation token from the approver GitHub App,
+      # used ONLY to read org team membership. The App needs just org
+      # Members: read — nothing else.
+      - name: Mint app token for team lookup
+        id: app-token
+        uses: actions/create-github-app-token@v1  # pin to a full commit SHA in the real change
+        with:
+          app-id: ${{ secrets.APPROVER_APP_ID }}
+          private-key: ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}  # org-scoped token (not repo-only)
+
+      - name: Wait for approval
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          # Named maintainers team whose members are the eligible approvers.
+          APPROVER_TEAM: skyfire-agent-maintainers
+          # App token used ONLY to expand the team (least privilege).
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          # No github-token override: `github` stays the default GITHUB_TOKEN and
+          # owns the issue (created/closed as github-actions[bot]). The app token
+          # is used via a separate client purely for team membership.
+          script: |
+            const actor = context.actor;
+            const org = context.repo.owner;
+            const team_slug = process.env.APPROVER_TEAM;
+
+            // Expand the named team into its members with the app token
+            // (org Members: read); everything else runs on the default GITHUB_TOKEN.
+            const orgClient = require('@actions/github').getOctokit(process.env.APP_TOKEN);
+            const members = await orgClient.paginate(orgClient.rest.teams.listMembersInOrg, {
+              org, team_slug, per_page: 100,
+            });
+            const APPROVERS = members.map(m => m.login);
+            core.info(`Approver team @${org}/${team_slug} → ${APPROVERS.join(', ') || '(none)'}`);
+
+            const allowed = new Set(
+              // TEST ONLY: actor filter removed so self-approval works for the
+              // spike. Restore `.filter(u => u.toLowerCase() !== actor.toLowerCase())`
+              // (and uncomment the actor check below) before merging.
+              APPROVERS.map(u => u.toLowerCase())
+            );
+            if (allowed.size === 0) { core.setFailed('No eligible approver other than the actor'); return; }
+            const APPROVE = /^(approve|approved|lgtm|yes)[.!]?$/i;
+            const DENY    = /^(deny|denied|no)[.!]?$/i;
+            const { owner, repo } = context.repo;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            const issue = await github.rest.issues.create({
+              owner, repo,
+              title: `Prod deploy approval — run ${context.runId}`,
+              body: [
+                `Requested by @${actor}`,
+                `Workflow: ${context.workflow}`,
+                `Run: ${runUrl}`,
+                ``,
+                `Eligible approvers (anyone except @${actor}): ${[...allowed].map(u => '@' + u).join(', ')}`,
+                `Comment **approve** or **deny**.`,
+              ].join('\n'),
+              labels: ['prod-approval'],
+            });
+            const issue_number = issue.data.number;
+            const close = () => github.rest.issues.update({ owner, repo, issue_number, state: 'closed' });
+            core.info(`Waiting for approval on issue #${issue_number}`);
+
+            const deadline = Date.now() + 55 * 60 * 1000;
+            let poll = 0;
+            while (Date.now() < deadline) {
+              poll++;
+              const minsLeft = Math.ceil((deadline - Date.now()) / 60000);
+              core.info(`Poll #${poll}: waiting for approve/deny on issue #${issue_number} (~${minsLeft} min left)`);
+              const { data: comments } =
+                await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+              for (const c of comments) {
+                const login = c.user.login.toLowerCase();
+                //if (login === actor.toLowerCase()) continue; // no self-approval
+                if (!allowed.has(login)) continue;           // must be an eligible approver
+                const body = (c.body || '').trim();
+                if (DENY.test(body))    { await close(); core.setFailed(`Denied by @${c.user.login}`); return; }
+                if (APPROVE.test(body)) { await close(); core.info(`Approved by @${c.user.login}`); return; }
+              }
+              await new Promise(r => setTimeout(r, 15000));
+            }
+            await close();
+            core.setFailed('Approval timed out');
+
+  deploy-prod:
+    name: Deploy Prod Render service
+    runs-on: ubuntu-latest
+    needs: approval
+    # Prod environment gates required-reviewer approval and provides the
+    # RENDER_SERVICE_ID. RENDER_API_KEY is inherited from the org-level secret.
+    environment: prod
+    steps:
+      # TEST ONLY: the real Render deploy is stubbed out for the gate spike so
+      # approving does NOT deploy anything. Restore the "Trigger Render deploy"
+      # and "Wait for deploy to finish" steps (see commit 61a4259) before merging.
+      - name: Deploy (dry-run stub)
+        run: |
+          echo "DRY RUN: approval gate passed; would trigger Render deploy here."
+          echo "Real deploy is disabled for the spike — no external call made."
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: deploy-prod
+    if: success()
+    steps:
+      # TEST ONLY: real tag + GitHub Release creation is stubbed out for the
+      # spike. Restore the checkout/tag/release steps (commit 61a4259) before merging.
+      - name: Release (dry-run stub)
+        run: |
+          echo "DRY RUN: would create release tag + GitHub Release here."
