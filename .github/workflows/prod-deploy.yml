@@ -132,6 +132,11 @@ jobs:
               poll++;
               const minsLeft = Math.ceil((deadline - Date.now()) / 60000);
               core.info(`Poll #${poll}: waiting for approve/deny on issue #${issue_number} (~${minsLeft} min left)`);
+              const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number });
+              if (issue.state === 'closed') {
+                core.setFailed(`Approval issue #${issue_number} was closed manually — treating as cancelled.`);
+                return;
+              }
               const { data: comments } =
                 await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
               for (const c of comments) {
