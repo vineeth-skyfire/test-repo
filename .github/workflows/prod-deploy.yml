@@ -64,30 +64,38 @@ jobs:
           private-key: ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}  # org-scoped token (not repo-only)
 
-      - name: Wait for approval
+      # Expand the named team into its members, authenticated with the app token
+      # (org Members: read). Kept in its own step so ONLY this call uses the app
+      # token; the approval step below runs as the default github-actions[bot].
+      - name: Resolve approver team
+        id: resolve
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           # Named maintainers team whose members are the eligible approvers.
           APPROVER_TEAM: test-maintainers
-          # App token used ONLY to expand the team (least privilege).
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
-          # No github-token override: `github` stays the default GITHUB_TOKEN and
-          # owns the issue (created/closed as github-actions[bot]). The app token
-          # is used via a separate client purely for team membership.
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const actor = context.actor;
             const org = context.repo.owner;
             const team_slug = process.env.APPROVER_TEAM;
-
-            // Expand the named team into its members with the app token
-            // (org Members: read); everything else runs on the default GITHUB_TOKEN.
-            const orgClient = require('@actions/github').getOctokit(process.env.APP_TOKEN);
-            const members = await orgClient.paginate(orgClient.rest.teams.listMembersInOrg, {
+            const members = await github.paginate(github.rest.teams.listMembersInOrg, {
               org, team_slug, per_page: 100,
             });
-            const APPROVERS = members.map(m => m.login);
-            core.info(`Approver team @${org}/${team_slug} → ${APPROVERS.join(', ') || '(none)'}`);
+            const approvers = members.map(m => m.login);
+            core.info(`Approver team @${org}/${team_slug} → ${approvers.join(', ') || '(none)'}`);
+            core.setOutput('approvers', JSON.stringify(approvers));
+
+      - name: Wait for approval
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          # Approver logins resolved by the previous step (via the app token).
+          APPROVERS_JSON: ${{ steps.resolve.outputs.approvers }}
+        with:
+          # No github-token override: `github` is the default GITHUB_TOKEN, so the
+          # issue is created/closed as github-actions[bot].
+          script: |
+            const actor = context.actor;
+            const APPROVERS = JSON.parse(process.env.APPROVERS_JSON || '[]');
 
             const allowed = new Set(
               // TEST ONLY: actor filter removed so self-approval works for the
